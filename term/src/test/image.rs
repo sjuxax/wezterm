@@ -248,3 +248,158 @@ fn kitty_frame_edit_keeps_the_stored_hash_current() {
 
     assert_ne!(edited_hash, transmitted_hash);
 }
+
+/// Clients swap what a placeholder grid shows (a video frame, a before /
+/// after toggle) by retransmitting under the same image id and leaving the
+/// placeholder cells alone, which are unchanged text to them. As in kitty,
+/// the cells must show the new image without being reprinted.
+#[test]
+fn kitty_unicode_placeholder_follows_retransmitted_image() {
+    let mut term = TestTerm::new(3, 10, 0);
+
+    let seq = format!("\x1b_Ga=t,i=42,t=d,f=100;{}\x1b\\", TINY_PNG_BASE64);
+    term.print(seq.as_bytes());
+    term.print("\x1b_Ga=p,U=1,i=42,c=2,r=2\x1b\\");
+    term.print("\x1b[38;2;0;0;42m");
+    term.print("\u{10eeee}\u{305}\u{305}\u{10eeee}\u{305}\u{30d}");
+    let printed = first_image(&term).hash();
+    let seqno_before = term.screen().visible_lines()[0].current_seqno();
+
+    let seq = format!("\x1b_Ga=t,i=42,t=d,f=32,s=2,v=2;{}\x1b\\", TINY_RGBA_BASE64);
+    term.print(seq.as_bytes());
+
+    let lines = term.screen().visible_lines();
+    for cell in lines[0].visible_cells().take(2) {
+        let images = cell.attrs().images().expect("image tile attached");
+        assert_ne!(images[0].image_data().hash(), printed);
+    }
+    // The line must be marked changed, or the gui never repaints it
+    assert_ne!(lines[0].current_seqno(), seqno_before);
+}
+
+/// Prints a 2x1 placeholder grid for image 42 on the first row, then
+/// pushes it into scrollback with ordinary output.
+fn placeholders_scrolled_into_scrollback() -> TestTerm {
+    let mut term = TestTerm::new(3, 10, 10);
+
+    let seq = format!("\x1b_Ga=t,i=42,t=d,f=100;{}\x1b\\", TINY_PNG_BASE64);
+    term.print(seq.as_bytes());
+    term.print("\x1b_Ga=p,U=1,i=42,c=2,r=1\x1b\\");
+    term.print("\x1b[38;2;0;0;42m");
+    term.print("\u{10eeee}\u{305}\u{305}\u{10eeee}\u{305}\u{30d}");
+    term.print("\x1b[39m\r\n\n\n\n");
+
+    let first_line = &term.screen().all_lines()[0];
+    assert_eq!(term.screen().scrollback_rows() > 3, true);
+    assert_eq!(
+        first_line
+            .visible_cells()
+            .next()
+            .unwrap()
+            .attrs()
+            .images()
+            .is_some(),
+        true
+    );
+    term
+}
+
+/// Updating an image must reach placeholders that have since scrolled
+/// out of view, as kitty resolves them by id however far back they are.
+#[test]
+fn kitty_unicode_placeholder_in_scrollback_follows_retransmitted_image() {
+    let mut term = placeholders_scrolled_into_scrollback();
+    let printed = term.screen().all_lines()[0]
+        .visible_cells()
+        .next()
+        .and_then(|cell| cell.attrs().images())
+        .expect("image tile attached")[0]
+        .image_data()
+        .hash();
+
+    let seq = format!("\x1b_Ga=t,i=42,t=d,f=32,s=2,v=2;{}\x1b\\", TINY_RGBA_BASE64);
+    term.print(seq.as_bytes());
+
+    let lines = term.screen().all_lines();
+    for cell in lines[0].visible_cells().take(2) {
+        let images = cell.attrs().images().expect("image tile attached");
+        assert_ne!(images[0].image_data().hash(), printed);
+    }
+}
+
+/// Deleting an image must detach it from placeholders in scrollback too,
+/// or scrolling back shows an image the client has deleted.
+#[test]
+fn kitty_unicode_placeholder_in_scrollback_is_detached_on_delete() {
+    let mut term = placeholders_scrolled_into_scrollback();
+
+    term.print("\x1b_Ga=d,d=I,i=42\x1b\\");
+
+    let lines = term.screen().all_lines();
+    for cell in lines[0].visible_cells().take(2) {
+        assert_eq!(cell.attrs().images().is_none(), true);
+    }
+}
+
+/// Whether any cell on the primary screen still shows the given image.
+fn primary_screen_shows(term: &TestTerm, image_id: u32) -> bool {
+    term.screen().all_lines().iter().any(|line| {
+        line.visible_cells().any(|cell| {
+            cell.attrs().images().map_or(false, |images| {
+                images.iter().any(|im| im.image_id() == Some(image_id))
+            })
+        })
+    })
+}
+
+/// Updating an image while a fullscreen app holds the alternate screen
+/// must still reach placeholders on the primary screen, or they show the
+/// old image once the app exits.
+#[test]
+fn kitty_unicode_placeholder_on_inactive_screen_follows_retransmitted_image() {
+    let mut term = TestTerm::new(3, 10, 0);
+
+    let seq = format!("\x1b_Ga=t,i=42,t=d,f=100;{}\x1b\\", TINY_PNG_BASE64);
+    term.print(seq.as_bytes());
+    term.print("\x1b_Ga=p,U=1,i=42,c=2,r=1\x1b\\");
+    term.print("\x1b[38;2;0;0;42m");
+    term.print("\u{10eeee}\u{305}\u{305}\u{10eeee}\u{305}\u{30d}");
+    term.print("\x1b[39m");
+    let printed = first_image(&term).hash();
+
+    term.print("\x1b[?1049h");
+    let seq = format!("\x1b_Ga=t,i=42,t=d,f=32,s=2,v=2;{}\x1b\\", TINY_RGBA_BASE64);
+    term.print(seq.as_bytes());
+    term.print("\x1b[?1049l");
+
+    assert_ne!(first_image(&term).hash(), printed);
+}
+
+/// Deleting an image while the alternate screen is active must detach it
+/// from the primary screen as well, for placeholders and for regular
+/// placements alike.
+#[test]
+fn kitty_delete_reaches_inactive_screen() {
+    let mut term = TestTerm::new(3, 10, 0);
+
+    // A regular placement of image 7, and a placeholder of image 42
+    let seq = format!(
+        "\x1b_Ga=T,i=7,c=1,r=1,C=1,t=d,f=100;{}\x1b\\",
+        TINY_PNG_BASE64
+    );
+    term.print(seq.as_bytes());
+    let seq = format!("\x1b_Ga=t,i=42,t=d,f=100;{}\x1b\\", TINY_PNG_BASE64);
+    term.print(seq.as_bytes());
+    term.print("\x1b_Ga=p,U=1,i=42,c=1,r=1\x1b\\");
+    term.print("\r\n\x1b[38;2;0;0;42m\u{10eeee}\u{305}\u{305}\x1b[39m");
+    assert_eq!(primary_screen_shows(&term, 7), true);
+    assert_eq!(primary_screen_shows(&term, 42), true);
+
+    term.print("\x1b[?1049h");
+    term.print("\x1b_Ga=d,d=I,i=7\x1b\\");
+    term.print("\x1b_Ga=d,d=I,i=42\x1b\\");
+    term.print("\x1b[?1049l");
+
+    assert_eq!(primary_screen_shows(&term, 7), false);
+    assert_eq!(primary_screen_shows(&term, 42), false);
+}

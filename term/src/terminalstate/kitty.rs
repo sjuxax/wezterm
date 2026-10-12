@@ -1,12 +1,13 @@
 use crate::terminalstate::image::*;
-use crate::terminalstate::{ImageAttachParams, PlacementInfo};
-use crate::{StableRowIndex, TerminalState, VisibleRowIndex};
+use crate::terminalstate::{ImageAttachParams, PlacementInfo, ScreenKind};
+use crate::{Line, StableRowIndex, TerminalState, VisibleRowIndex};
 use ::image::{
     DynamicImage, GenericImage, GenericImageView, ImageBuffer, RgbImage, Rgba, RgbaImage,
 };
 use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 use wezterm_cell::color::ColorAttribute;
@@ -99,6 +100,11 @@ pub struct KittyImageState {
     id_to_data: HashMap<u32, Arc<ImageData>>,
     placements: HashMap<(u32, Option<u32>), PlacementInfo>,
     virtual_placements: HashMap<(u32, Option<u32>), KittyVirtualPlacement>,
+    /// The stable rows that placeholder cells of each image id were
+    /// printed on, per screen, so that updating or removing the image
+    /// reaches them wherever they are now: in scrollback, or on the
+    /// screen that isn't active.
+    placeholder_rows: HashMap<(u32, ScreenKind), Range<StableRowIndex>>,
     used_memory: usize,
 }
 
@@ -393,6 +399,19 @@ impl TerminalState {
                 )));
         }
 
+        if cell.attrs().images().is_some() {
+            let row = self.screen().visible_row_to_stable_row(y);
+            let screen = self.screen.active_kind();
+            self.kitty_img
+                .placeholder_rows
+                .entry((image_id, screen))
+                .and_modify(|rows| {
+                    rows.start = rows.start.min(row);
+                    rows.end = rows.end.max(row + 1);
+                })
+                .or_insert(row..row + 1);
+        }
+
         self.screen_mut().set_cell(x, y, &cell, seqno);
         true
     }
@@ -563,40 +582,97 @@ impl TerminalState {
         Ok(())
     }
 
+    /// Apply `f` to each line a placement covers, on the screen it was
+    /// placed on even if that screen isn't active, and mark the lines
+    /// that `f` reports as changed.
+    fn kitty_update_placement_lines(
+        &mut self,
+        info: &PlacementInfo,
+        mut f: impl FnMut(&mut Line) -> bool,
+    ) {
+        let seqno = self.seqno;
+        let screen = self.screen.by_kind_mut(info.screen);
+        let range =
+            screen.stable_range(&(info.first_row..info.first_row + info.rows as StableRowIndex));
+        for idx in range {
+            let line = screen.line_mut(idx);
+            if f(line) {
+                line.update_last_change_seqno(seqno);
+            }
+        }
+    }
+
     fn kitty_remove_placement_from_model(
         &mut self,
         image_id: u32,
         placement_id: Option<u32>,
         info: PlacementInfo,
     ) {
-        let seqno = self.seqno;
-        let screen = self.screen_mut();
-        let range =
-            screen.stable_range(&(info.first_row..info.first_row + info.rows as StableRowIndex));
-        for idx in range {
-            let line = screen.line_mut(idx);
+        self.kitty_update_placement_lines(&info, |line| {
             for c in line.cells_mut() {
                 c.attrs_mut()
                     .detach_image_with_placement(image_id, placement_id);
             }
-            line.update_last_change_seqno(seqno);
-        }
+            true
+        });
     }
 
-    /// Placeholder cells referencing a virtual placement can be anywhere
-    /// in the visible screen, so detach across all of it rather than a
-    /// recorded placement range.
+    /// The extent of the rows that placeholders of an image were printed
+    /// on, one per screen they were printed on.
+    fn kitty_placeholder_extents(&self, image_id: u32) -> Vec<PlacementInfo> {
+        self.kitty_img
+            .placeholder_rows
+            .iter()
+            .filter(|((id, _), _)| *id == image_id)
+            .map(|((_, screen), rows)| PlacementInfo {
+                first_row: rows.start,
+                rows: (rows.end - rows.start) as usize,
+                cols: 0,
+                screen: *screen,
+            })
+            .collect()
+    }
+
+    /// Detach a virtual placement from the rows its placeholders were
+    /// printed on, wherever those rows are now.
     fn kitty_remove_virtual_placement_from_model(
         &mut self,
         image_id: u32,
         placement_id: Option<u32>,
     ) {
-        let info = PlacementInfo {
-            first_row: self.screen().visible_row_to_stable_row(0),
-            rows: self.screen().physical_rows,
-            cols: 0,
-        };
-        self.kitty_remove_placement_from_model(image_id, placement_id, info);
+        for info in self.kitty_placeholder_extents(image_id) {
+            self.kitty_remove_placement_from_model(image_id, placement_id, info);
+        }
+    }
+
+    /// Once an image has no virtual placements left, no placeholder can
+    /// resolve to it anymore and its rows no longer need tracking.
+    fn kitty_forget_unused_placeholder_rows(&mut self, image_id: u32) {
+        if !self
+            .kitty_img
+            .virtual_placements
+            .keys()
+            .any(|(id, _)| *id == image_id)
+        {
+            self.kitty_img
+                .placeholder_rows
+                .retain(|(id, _), _| *id != image_id);
+        }
+    }
+
+    /// Placeholder cells hold the image data that was current when they
+    /// were printed. Retransmitting an image under the same id must update
+    /// them in place, since the client won't reprint unchanged placeholders.
+    fn kitty_replace_virtual_image_data(&mut self, image_id: u32, data: &Arc<ImageData>) {
+        for info in self.kitty_placeholder_extents(image_id) {
+            self.kitty_update_placement_lines(&info, |line| {
+                let mut replaced = false;
+                for c in line.cells_mut() {
+                    replaced |= c.attrs_mut().replace_image_data(image_id, data);
+                }
+                replaced
+            });
+        }
     }
 
     fn kitty_remove_placement(&mut self, image_id: u32, placement_id: Option<u32>) {
@@ -637,6 +713,7 @@ impl TerminalState {
                 self.kitty_remove_virtual_placement_from_model(image_id, p);
             }
         }
+        self.kitty_forget_unused_placeholder_rows(image_id);
 
         log::trace!(
             "after remove: there are {} placements, {} images, {} memory",
@@ -654,6 +731,7 @@ impl TerminalState {
         {
             self.kitty_remove_virtual_placement_from_model(image_id, p);
         }
+        self.kitty_img.placeholder_rows.clear();
         if delete {
             self.kitty_img.id_to_data.clear();
             self.kitty_img.used_memory = 0;
@@ -1146,7 +1224,8 @@ impl TerminalState {
         let img = self
             .raw_image_to_image_data(img)
             .context("storing image data")?;
-        self.kitty_img.record_id_to_data(image_id, img);
+        self.kitty_img.record_id_to_data(image_id, Arc::clone(&img));
+        self.kitty_replace_virtual_image_data(image_id, &img);
 
         if image_number.is_some() {
             self.kitty_send_response(
